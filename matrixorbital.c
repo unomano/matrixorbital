@@ -12,18 +12,37 @@
 #include <linux/i2c.h>
 #include <linux/input-polldev.h>
 #include <linux/kernel.h>
+#include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #define MATRIXORBITAL_POLL_KEY_PRESS	0x26
 #define MATRIXORBITAL_READ_MODULE_TYPE 0x37
 #define MATRIXORBITAL_AUTO_TX_KEY_PRESS_OFF 0x4F
+#define MATRIXORBITAL_GPO_OFF 0x56
+#define MATRIXORBITAL_GPO_ON 0x57
 #define MATRIXORBITAL_CLEAR_SCREEN 0x58
 #define MATRIXORBITAL_DRAW_BITMAP_DIRECTLY 0x64
 #define MATRIXORBITAL_TX_PROTOCOL_SELECT 0xA0
 
+#define MATRIXORBITAL_MAX_LEDS 6
+
 static u_int refreshrate = 5;
 module_param(refreshrate, uint, 0);
+
+struct matrixorbital_led {
+	struct led_classdev	cdev;
+	u8 gpio_number;
+	u8 brightness;
+	struct work_struct work;
+	struct i2c_client *client;
+};
+
+static const char* matrixorbital_leds[] = {
+	"led1:red",	"led1:green",
+	"led2:red",	"led2:green",
+	"led3:red",	"led3:green" };
 
 struct matrixorbital_par {
 	struct i2c_client *client;
@@ -31,6 +50,7 @@ struct matrixorbital_par {
 	u32 height;
 	struct fb_info *info;
 	struct input_polled_dev	*idev;
+	struct matrixorbital_led *led[MATRIXORBITAL_MAX_LEDS];
 };
 
 static const struct fb_fix_screeninfo matrixorbitalfb_fix = {
@@ -53,7 +73,7 @@ static int matrixorbital_write_array(struct i2c_client *client, u8 *buf, u32 len
 
 	ret = i2c_master_send(client, buf, len);
 	if (ret != len) {
-		dev_err(&client->dev, "Couldn't send I2C command.\n");
+		dev_err(&client->dev, "Couldn't send I2C command 0x%x 0x%x (len=%d): %d\n", buf[1], buf[2], len, ret);
 		return -1;
 	}
 
@@ -85,11 +105,15 @@ static int matrixorbital_read_param(struct i2c_client *client, u8 cmd)
 	matrixorbital_write_cmd(client, cmd);
 	msleep(5);
 	ret = i2c_master_recv(client, &data, sizeof(data));
-	return (ret == 1) ? data : ret;
+	if (ret == 1)
+		return data;
+	else {
+		dev_err(&client->dev, "Couldn't recv 0x%x I2C command.\n", cmd);
+		return -1;
+	}
 }
 
-static unsigned char reverse_bits_in_byte(unsigned char b)
-{
+static unsigned char reverse_bits_in_byte(unsigned char b) {
 	b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
 	b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
 	b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
@@ -121,7 +145,7 @@ static void matrixorbitalfb_update_display(struct matrixorbital_par *par)
 }
 
 static ssize_t matrixorbitalfb_write(struct fb_info *info, const char __user *buf,
-									 size_t count, loff_t *ppos)
+		size_t count, loff_t *ppos)
 {
 	struct matrixorbital_par *par = info->par;
 	unsigned long total_size;
@@ -188,7 +212,7 @@ static struct fb_ops matrixorbitalfb_ops = {
 };
 
 static void matrixorbitalfb_deferred_io(struct fb_info *info,
-										struct list_head *pagelist)
+				struct list_head *pagelist)
 {
 	matrixorbitalfb_update_display(info->par);
 }
@@ -220,31 +244,32 @@ static void matrixorbital_report_key(struct input_dev *input, unsigned matrixorb
 {
 	u8 keycode = 0;
 
-	switch(matrixorbital_keycode) {
-	case 0x41:
-		keycode = KEY_ESC;
-		break;
-	case 0x42:
-		keycode = KEY_UP;
-		break;
-	case 0x43:
-		keycode = KEY_RIGHT;
-		break;
-	case 0x44:
-		keycode = KEY_LEFT;
-		break;
-	case 0x45:
-		keycode = KEY_ENTER;
-		break;
-	case 0x47:
-		keycode = KEY_BACKSPACE;
-		break;
-	case 0x48:
-		keycode = KEY_DOWN;
-		break;
-	default:
-		dev_err(&input->dev, "Unknown keycode 0x%x\n", matrixorbital_keycode);
-		break;
+	switch(matrixorbital_keycode)
+	{
+		case 0x41:
+			keycode = KEY_ESC;
+			break;
+		case 0x42:
+			keycode = KEY_UP;
+			break;
+		case 0x43:
+			keycode = KEY_RIGHT;
+			break;
+		case 0x44:
+			keycode = KEY_LEFT;
+			break;
+		case 0x45:
+			keycode = KEY_ENTER;
+			break;
+		case 0x47:
+			keycode = KEY_BACKSPACE;
+			break;
+		case 0x48:
+			keycode = KEY_DOWN;
+			break;
+		default:
+			dev_err(&input->dev, "Unknown keycode 0x%x\n", matrixorbital_keycode);
+			break;
 	}
 
 	dev_err(&input->dev, "Report key %d [0x%x]\n", keycode, matrixorbital_keycode);
@@ -273,6 +298,23 @@ static void matrixorbital_keypad_poll(struct input_polled_dev *ipdev)
 	} while (ret & 0x80);
 }
 
+static void matrixorbital_led_set(struct led_classdev *cdev,
+			      enum led_brightness value)
+{
+	struct matrixorbital_led *led = container_of(cdev, struct matrixorbital_led, cdev);
+
+	led->brightness = value;
+	schedule_work(&led->work);
+}
+
+static void matrixorbital_led_work(struct work_struct *work)
+{
+	struct matrixorbital_led *led = container_of(work, struct matrixorbital_led, work);
+	matrixorbital_write_param(led->client,
+		(led->brightness != LED_OFF) ? MATRIXORBITAL_GPO_OFF : MATRIXORBITAL_GPO_ON,
+		led->gpio_number);
+}
+
 static int matrixorbital_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	struct fb_info *info;
@@ -282,6 +324,7 @@ static int matrixorbital_probe(struct i2c_client *client, const struct i2c_devic
 	u8 *vmem;
 	int ret;
 	struct input_polled_dev *keypad_dev;
+	int i;
 
 	info = framebuffer_alloc(sizeof(struct matrixorbital_par), &client->dev);
 	if (!info) {
@@ -300,7 +343,7 @@ static int matrixorbital_probe(struct i2c_client *client, const struct i2c_devic
 	vmem_size = par->width * par->height / 8;
 
 	vmem = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
-									get_order(vmem_size));
+					get_order(vmem_size));
 	if (!vmem) {
 		dev_err(&client->dev, "Couldn't allocate graphical memory.\n");
 		ret = -ENOMEM;
@@ -308,7 +351,7 @@ static int matrixorbital_probe(struct i2c_client *client, const struct i2c_devic
 	}
 
 	matrixorbitalfb_defio = devm_kzalloc(&client->dev, sizeof(*matrixorbitalfb_defio),
-										 GFP_KERNEL);
+				       GFP_KERNEL);
 	if (!matrixorbitalfb_defio) {
 		dev_err(&client->dev, "Couldn't allocate deferred io.\n");
 		ret = -ENOMEM;
@@ -385,6 +428,28 @@ static int matrixorbital_probe(struct i2c_client *client, const struct i2c_devic
 		goto err_free_dev;
 	}
 
+	/* LEDs */
+	for (i = 0; i < ARRAY_SIZE(matrixorbital_leds); i++) {
+		struct matrixorbital_led *led;
+
+		led = kzalloc(sizeof(*led), GFP_KERNEL);
+		if (!led)
+			break;
+
+		led->cdev.name = matrixorbital_leds[i];
+		led->cdev.brightness_set = matrixorbital_led_set;
+		led->cdev.default_trigger = "timer";
+		led->client = client;
+		led->gpio_number = i + 1;
+		INIT_WORK(&(led->work), matrixorbital_led_work);
+
+		if (led_classdev_register(NULL, &led->cdev) < 0) {
+			kfree(led);
+			break;
+		}
+		par->led[i] = led;
+	}
+
 	dev_info(&client->dev, "fb%d: %s framebuffer device registered, using %d bytes of video memory\n", info->node, info->fix.id, vmem_size);
 
 	return 0;
@@ -402,6 +467,14 @@ static int matrixorbital_remove(struct i2c_client *client)
 {
 	struct fb_info *info = i2c_get_clientdata(client);
 	struct matrixorbital_par *par = info->par;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(matrixorbital_leds); i++) {
+		led_classdev_unregister(&par->led[i]->cdev);
+		cancel_work_sync(&(par->led[i]->work));
+		kfree(par->led[i]);
+		par->led[i] = NULL;
+	}
 
 	input_unregister_polled_device(par->idev);
 	input_free_polled_device(par->idev);
